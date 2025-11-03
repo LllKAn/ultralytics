@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.utils.angle import UCResolver
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
@@ -301,7 +302,7 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, angle)
 
 
 class v8SegmentationLoss(v8DetectionLoss):
@@ -564,7 +565,7 @@ class v8PoseLoss(v8DetectionLoss):
         loss[3] *= self.hyp.cls  # cls gain
         loss[4] *= self.hyp.dfl  # dfl gain
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, angle)
 
     @staticmethod
     def kpts_decode(anchor_points: torch.Tensor, pred_kpts: torch.Tensor) -> torch.Tensor:
@@ -667,6 +668,13 @@ class v8OBBLoss(v8DetectionLoss):
         super().__init__(model)
         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
+        head = model.model[-1]
+        angle_dim = getattr(head, "ne", 3)
+        self.angle_resolver = getattr(
+            head,
+            "angle_resolver",
+            UCResolver("le90", mdim=angle_dim, loss_angle_restrict={"type": "MSELoss", "reduction": "mean"}),
+        )
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection."""
@@ -687,7 +695,7 @@ class v8OBBLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, angle
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -697,7 +705,8 @@ class v8OBBLoss(v8DetectionLoss):
         # b, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-        pred_angle = pred_angle.permute(0, 2, 1).contiguous()
+        pred_angle_encoded = pred_angle.permute(0, 2, 1).contiguous()
+        pred_angle_decoded = self.angle_resolver.decode(pred_angle_encoded, keepdim=True)
 
         dtype = pred_scores.dtype
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
@@ -722,7 +731,7 @@ class v8OBBLoss(v8DetectionLoss):
             ) from e
 
         # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xyxy, (b, h*w, 4)
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle_decoded)  # xyxy, (b, h*w, 4)
 
         bboxes_for_assigner = pred_bboxes.clone().detach()
         # Only the first four elements need to be scaled
@@ -743,19 +752,37 @@ class v8OBBLoss(v8DetectionLoss):
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
         # Bbox loss
+        restrict_gain = getattr(self.hyp, "angle_restrict", 1.0)
+
         if fg_mask.sum():
             target_bboxes[..., :4] /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
+            target_angles = target_bboxes[..., 4:5]
+            target_encoded = self.angle_resolver.encode(target_angles)
+            encoded_diff = (pred_angle_encoded - target_encoded).square().mean(-1, keepdim=True)
+            weight = target_scores.sum(-1, keepdim=True)
+            loss[3] = (encoded_diff[fg_mask] * weight[fg_mask]).sum() / target_scores_sum
+            if (
+                restrict_gain
+                and self.angle_resolver.loss_angle_restrict is not None
+                and fg_mask.any()
+            ):
+                restrict = self.angle_resolver.get_restrict_loss(pred_angle_encoded[fg_mask])
+                if restrict.numel():
+                    loss[3] += restrict_gain * restrict.mean()
         else:
-            loss[0] += (pred_angle * 0).sum()
+            zero_tensor = pred_angle_decoded * 0
+            loss[0] += zero_tensor.sum()
+            loss[3] += zero_tensor.sum()
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= getattr(self.hyp, "angle", 1.0)  # angle gain
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, angle)
 
     def bbox_decode(
         self, anchor_points: torch.Tensor, pred_dist: torch.Tensor, pred_angle: torch.Tensor
