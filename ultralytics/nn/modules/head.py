@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import math
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
+from ultralytics.utils.angle import UCResolver
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
@@ -300,12 +302,12 @@ class OBB(Detect):
 
     Examples:
         Create an OBB detection head
-        >>> obb = OBB(nc=80, ne=1, ch=(256, 512, 1024))
+        >>> obb = OBB(nc=80, ne=3, ch=(256, 512, 1024))
         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
         >>> outputs = obb(x)
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, ch: tuple = ()):
+    def __init__(self, nc: int = 80, ne: int | dict[str, Any] = 3, ch: tuple | list = ()):  # type: ignore[valid-type]
         """
         Initialize OBB with number of classes `nc` and layer channels `ch`.
 
@@ -314,8 +316,31 @@ class OBB(Detect):
             ne (int): Number of extra parameters.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        super().__init__(nc, ch)
-        self.ne = ne  # number of extra parameters
+        resolver_cfg: dict[str, Any]
+        if isinstance(ne, dict):
+            resolver_cfg = ne.copy()
+            self.ne = int(resolver_cfg.pop("mdim", resolver_cfg.pop("ne", 3)))
+        else:
+            resolver_cfg = {}
+            self.ne = int(ne)
+
+        if not isinstance(ch, (list, tuple)):
+            raise TypeError("Expected channels argument to be a sequence of feature dimensions.")
+        super().__init__(nc, tuple(ch))
+
+        resolver_kwargs: dict[str, Any] = {
+            "angle_version": resolver_cfg.pop("angle_version", "le90"),
+            "mdim": self.ne,
+            "invalid_thr": resolver_cfg.pop("invalid_thr", 0.0),
+            "loss_angle_restrict": resolver_cfg.pop(
+                "loss_angle_restrict", {"type": "MSELoss", "reduction": "mean"}
+            ),
+        }
+        if resolver_cfg:
+            unexpected = ", ".join(sorted(resolver_cfg))
+            raise ValueError(f"Unsupported UCResolver options: {unexpected}")
+
+        self.angle_resolver = UCResolver(**resolver_kwargs)
 
         c4 = max(ch[0] // 4, self.ne)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
@@ -323,16 +348,19 @@ class OBB(Detect):
     def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
         """Concatenate and return predicted bounding boxes and class probabilities."""
         bs = x[0].shape[0]  # batch size
-        angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)  # OBB theta logits
-        # NOTE: set `angle` as an attribute so that `decode_bboxes` could use it.
-        angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
-        # angle = angle.sigmoid() * math.pi / 2  # [0, pi/2]
+        angle_state = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)
+        angle_state = torch.tanh(angle_state)
         if not self.training:
-            self.angle = angle
+            decoded_angle = self.angle_resolver.decode(angle_state.permute(0, 2, 1), keepdim=True).permute(0, 2, 1)
+            self.angle = decoded_angle
         x = Detect.forward(self, x)
         if self.training:
-            return x, angle
-        return torch.cat([x, angle], 1) if self.export else (torch.cat([x[0], angle], 1), (x[1], angle))
+            return x, angle_state
+        return (
+            torch.cat([x, decoded_angle], 1)
+            if self.export
+            else (torch.cat([x[0], decoded_angle], 1), (x[1], decoded_angle))
+        )
 
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
         """Decode rotated bounding boxes."""
